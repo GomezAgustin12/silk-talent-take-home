@@ -1,6 +1,6 @@
 # Resilient Workflow Engine
 
-A React + NestJS application that runs multi-step async workflows with crash recovery, retry logic, and real-time status monitoring. Powered by **XState** for formal state machine semantics.
+A React + NestJS application that runs multi-step async workflows with crash recovery, retry logic, and real-time status monitoring. The workflow engine models the **interview flow as a declarative XState chart** — each interview step is a named state with its own invoke, retry policy, and transitions.
 
 ## Quick Start
 
@@ -40,10 +40,10 @@ interface Workflow {
   id: string;              // UUID, generated on creation
   name: string;            // Human-readable label (e.g. "Interview — John Doe")
   status: WorkflowStatus;  // pending | running | completed | failed
-  currentStepIndex: number;// Tracks which step is executing
+  currentStepIndex: number;// Index of the step currently executing / about to execute
   steps: WorkflowStep[];   // Ordered list of steps
   createdAt: string;       // ISO timestamp
-  updatedAt: string;       // Updated after every state change
+  updatedAt: string;       // Updated after every state-chart transition
   completedAt: string | null;
   error: string | null;    // Top-level error message if workflow failed
 }
@@ -78,68 +78,93 @@ interface StepError {
 
 ### Why This Structure
 
-**Flat step array with index tracking** — Steps are stored as an ordered array inside the workflow, with `currentStepIndex` tracking progress. This makes resume trivial: find the first non-completed step and continue from there. No need for a separate execution pointer table or linked list.
+**The Workflow JSON is the single source of truth.** The state chart's internal context is never persisted separately — every meaningful transition mutates the `Workflow` object via pure projection functions (`applyStepStarted`, `applyStepCompleted`, `applyStepFailed`) and then saves it. Resume reads the `Workflow`, computes the first non-completed step, and starts a fresh actor at that state. No XState snapshot blob; no risk of snapshot/chart drift after a code change.
 
-**Error classification at the step level** — Each step carries its own error with a `type` field (`transient` vs `fatal`). The engine uses pattern matching on error messages to classify: known fatal patterns (INVALID_CREDENTIALS, PERMISSION_DENIED, NOT_FOUND, VALIDATION_ERROR) stop execution immediately, everything else is treated as transient and retried with exponential backoff.
+**Flat step array with index tracking** — Steps are stored as an ordered array, and `currentStepIndex` always reflects which step the chart is inside. The frontend reads `currentStepIndex` and `steps[]` directly — the declarative chart refactor left the REST contract untouched.
 
-**Per-step persistence** — State is written to disk after every step transition (pending → in_progress, in_progress → completed/failed). If the process crashes mid-workflow, the JSON file on disk reflects the exact last known state. On resume, in_progress steps are reset to pending (since we can't know if the step completed or not), and execution continues from the first non-completed step.
+**Error classification at the step level** — Each step carries its own error with a `type` field (`transient` vs `fatal`). A shared classifier (`error-classifier.ts`) matches known fatal patterns (`INVALID_CREDENTIALS`, `PERMISSION_DENIED`, `NOT_FOUND`, `VALIDATION_ERROR`, `FATAL`) — the chart's `canRetry` guard uses this to decide whether to self-loop or jump to `failed`.
 
-**JSON file per workflow** — Each workflow gets its own file (`data/workflow-{id}.json`). This avoids contention on a single file and makes inspection/debugging easy — just `cat` the file to see the full state.
+**Per-transition persistence** — Every chart action that mutates the workflow (step started, step completed, step failed, workflow completed) ends with `persist(workflow)`. Persistence can't be forgotten because it's part of the action definition, not a per-call responsibility.
 
-**Step definitions are separate from step state** — The `StepDefinition` (with the `execute` function) lives in code, while `WorkflowStep` (state) lives in the JSON file. This separation means the persisted state is pure data with no serialized functions, and step logic can be updated without migrating existing workflow files.
+**JSON file per workflow** — Each workflow gets its own file (`data/workflow-{id}.json`). No contention on a single file; `cat` the file to inspect full state.
+
+**Step definitions are separate from step state** — The `StepDefinition` (with the `execute` function) lives in code, while `WorkflowStep` (state) lives in the JSON file. Step logic can be updated without migrating existing workflow files.
 
 ---
 
-## Why XState
+## Why XState — declaratively
 
-The workflow engine is fundamentally a state machine — it has defined states (`idle`, `executingStep`, `stepCompleted`, `completed`, `failed`), explicit transitions between them, and side effects (persistence, step invocation) tied to transitions. Rather than hand-rolling this with `if/else` chains and manual status tracking, I used [XState v5](https://statemachine.js.org/) to model it formally.
+An earlier iteration used XState as a generic step-iterator (`idle → executingStep → stepCompleted → executingStep → ...`, with steps as data iterated by `currentStepIndex`). That approach worked but turned XState into a wrapper around a `for` loop — it didn't buy anything you couldn't do with `try/catch`.
 
-### Benefits over a hand-rolled approach
+The current chart treats **the interview workflow itself as the state chart**. The five interview steps (`checkCalendar`, `updateCrm`, `sendConfirmation`, `prepareKit`, `notifyInterviewer`) are named states. Transitions between them are declared on the chart edges, not computed at runtime. The chart IS the domain.
 
-| Concern | Hand-rolled | XState |
-|---------|-------------|--------|
-| **State transitions** | Manual status field updates, easy to reach invalid states | Transitions are declarative — only valid transitions exist |
-| **Step execution** | `for` loop with `try/catch` | `invoke` with `fromPromise` — the machine handles async lifecycle |
-| **Retry logic** | Manual counter + loop | Retry lives inside the invoked actor with exponential backoff, classified by guards |
-| **Persistence** | Sprinkled `save()` calls | `persist` action fires on every transition — impossible to forget |
-| **Crash recovery** | Load JSON, find first non-completed step, re-run | Load JSON into context, send `START` — the machine resumes from the right state |
-| **Testability** | Test the whole engine end-to-end | Can unit test machine transitions, guards, and actions independently |
-| **Visualization** | Read the code | Paste the machine into [stately.ai/viz](https://stately.ai/viz) to see the state chart |
+### What that buys you
+
+| Concern | Generic iterator | Declarative chart |
+|---------|------------------|-------------------|
+| **Reading the code** | One generic state; you have to read `stepDefinitions[]` separately to understand the flow | The chart file is the workflow — five states, transitions between them, visible at a glance |
+| **Retry policy** | Loop counter + manual classification inside the iterator | `onError` guard (`canRetry`) self-targets the same state; per-state `maxRetries` declared via params |
+| **Branching** | Would require intrusive changes to the iterator | Each step can have its own `onDone`/`onError` targets — trivial to add compensating transitions, skip logic, or parallel regions |
+| **Visualization** | Nothing useful — the chart is a generic loop | Paste the machine into [stately.ai/viz](https://stately.ai/viz) and you see the real interview flow |
+| **Testability** | End-to-end tests only | Actors are injected via `setup({ actors })`; tests swap them per scenario without touching the chart |
 
 ### State Chart
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │                                         │
-  ┌──────┐  START   │  ┌──────────────┐   onDone   ┌───────────────┐
-  │ idle │─────────►│  │executingStep │───────────►│ stepCompleted │
-  └──────┘          │  │              │            │               │
-                    │  │  invoke:     │            │  [hasMore] ───┤
-                    │  │  executeStep │◄───────────┘    │          │
-                    │  │  (fromPromise)│  advance       │          │
-                    │  └──────┬───────┘                 │          │
-                    │         │ onError                 │          │
-                    │         ▼                         ▼          │
-                    │  ┌──────────┐              ┌───────────┐    │
-                    │  │  failed  │              │ completed │    │
-                    │  │  (final) │              │  (final)  │    │
-                    │  └──────────┘              └───────────┘    │
-                    │                                             │
-                    └─────────────────────────────────────────────┘
+                     ┌─────────────┐
+            (fresh)  │  dispatch   │
+         ┌──────────►│ (initial)   │
+         │           └──────┬──────┘
+         │     always guards: startAt ∈ context.input
+         │                  │
+         │     ┌────────────┼────────────┬────────────┬─────────────────┐
+         │     ▼            ▼            ▼            ▼                 ▼
+         │ ┌────────┐  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐
+         │ │ check  │  │ update  │  │   send   │  │ prepare  │  │   notify     │
+         │ │Calendar├─►│  Crm    ├─►│Confirmat.├─►│   Kit    ├─►│ Interviewer  │
+         │ └───┬────┘  └────┬────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘
+         │     │            │            │            │                │
+         │     │ onError    │ onError    │ onError    │ onError        │ onError
+         │     │ [canRetry] │            │            │                │
+         │     └─── self ───┘            │            │                │
+         │          (reenter)            │            │                │
+         │                               ▼            ▼                ▼
+         │                           ┌─────────────────────────┐  ┌──────────┐
+         │                           │         failed          │  │completed │
+         └───────── resume ──────────│         (final)         │  │ (final)  │
+                                     └─────────────────────────┘  └──────────┘
 ```
 
-**States:**
-- `idle` — Workflow created, waiting for `START` event
-- `executingStep` — Invokes the current step's `execute()` via `fromPromise`. Retries happen inside the invoked actor with exponential backoff
-- `stepCompleted` — Transient state that checks if more steps remain (guard: `hasMoreSteps`). If yes, advances index and loops back. If no, transitions to `completed`
-- `completed` — Final state. All steps finished successfully
-- `failed` — Final state. A step hit a fatal error or exhausted all retries
+Each step state has the same shape (produced by a `stepState(name, next)` helper):
 
-**Key design decisions:**
-- Retry logic lives inside the `fromPromise` actor, not as machine states. This keeps the state chart clean — the machine only sees "step succeeded" or "step failed"
-- Error classification (transient vs fatal) happens inside the step actor. Fatal errors throw immediately, transient errors retry up to `maxRetries`
-- The `persist` action fires on every transition, ensuring the JSON file is always up to date
-- The `WorkflowMachineContext` carries a `persistFn` callback — this keeps the machine decoupled from the persistence implementation
+```ts
+{
+  entry: { type: 'markStarted', params: { state: name } },
+  invoke: {
+    src: name,                              // registered in setup({ actors })
+    onDone:  { target: next,   actions: { type: 'markCompleted', params: { state: name } } },
+    onError: [
+      { guard: { type: 'canRetry', params: { state: name } },
+        target: `#interviewWorkflow.${name}`, reenter: true,
+        actions: { type: 'bumpAttempt', params: { state: name } } },
+      { target: 'failed', actions: { type: 'markFailed', params: { state: name } } },
+    ],
+  },
+}
+```
+
+### States
+
+- `dispatch` — Initial state for every actor. Uses `always` guards to jump to the correct starting step based on `input.startAt`. Fresh runs start at `checkCalendar`; resumed runs jump to the first non-completed step.
+- `checkCalendar` → `updateCrm` → `sendConfirmation` → `prepareKit` → `notifyInterviewer` — the five interview steps. Each one invokes its registered actor via `fromPromise`. On success, transition to the next step. On error, evaluate `canRetry`: if transient and attempts < maxRetries, self-loop; otherwise fall through to `failed`.
+- `completed` — Final state. Entry action sets `workflow.status = 'completed'` and persists.
+- `failed` — Final state. The failing state's `markFailed` action set the workflow error before transitioning here.
+
+### Why `dispatch` instead of snapshot restoration
+
+XState v5's `resolveState({ value })` produces a snapshot of a state, but when you feed that snapshot into `createActor(machine, { snapshot }).start()` the invokes of the resolved state are **not** re-activated — the actor resumes "inside" the state as if the invoke had already fired. That hangs the machine.
+
+The `dispatch` state sidesteps this entirely: every actor starts fresh from `dispatch` with `input.startAt` set to the target state, and `always` transitions fire immediately on entry, landing the actor in a state it's truly *entering* — so the `entry` action runs, the `invoke` kicks off, and the chart proceeds normally. It also keeps resume logic 100% declarative (no snapshot reconstitution on the service side).
 
 ---
 
@@ -153,35 +178,44 @@ The workflow engine is fundamentally a state machine — it has defined states (
 └─────────────┘               └────────┬────────┘
                                        │
                               ┌────────▼────────┐
-                              │ WorkflowEngine  │
+                              │ WorkflowService │
                               │                 │
-                              │  createActor()  │
-                              │  send('START')  │
-                              │  waitFor(done)  │
+                              │ build actorMap  │
+                              │ createActor()   │
+                              │ waitFor(done)   │
                               └────────┬────────┘
                                        │
-                    ┌──────────────────┼──────────────────┐
-                    │                  │                  │
-           ┌───────▼───────┐  ┌───────▼───────┐  ┌──────▼──────┐
-           │ XState Machine│  │  Persistence  │  │  Step Defs  │
-           │ (state chart) │  │ (JSON files)  │  │ (interview) │
-           └───────────────┘  └───────────────┘  └─────────────┘
+            ┌──────────────────────────┼──────────────────────────┐
+            │                          │                          │
+   ┌────────▼────────┐       ┌─────────▼────────┐        ┌────────▼────────┐
+   │  workflow-chart │       │   Persistence    │        │   Step Defs     │
+   │  (state chart + │       │  (JSON files)    │        │  (interview)    │
+   │  actions/guards)│       └──────────────────┘        └─────────────────┘
+   └────────┬────────┘
+            │
+   ┌────────▼────────┐         ┌──────────────────┐
+   │  projection     │         │ error-classifier │
+   │  (pure fns that │         │ (fatal pattern   │
+   │  mutate         │         │  matching)       │
+   │  Workflow REST) │         └──────────────────┘
+   └─────────────────┘
 ```
 
 ### Backend (NestJS)
 
-- **WorkflowMachine** (`workflow-machine.ts`) — XState v5 state chart defining the workflow lifecycle. States: `idle → executingStep → stepCompleted → completed|failed`. Each step is invoked via `fromPromise`, with retry logic and error classification inside the actor
-- **WorkflowEngine** (`workflow-engine.ts`) — Creates XState actors from the machine, sends `START`, and awaits completion via `waitFor`. Thin orchestration layer between NestJS and XState
-- **WorkflowPersistence** — Reads/writes workflow state to JSON files in the `data/` directory
-- **WorkflowService** — NestJS service that orchestrates engine + persistence. Handles resume by resetting `in_progress` steps before re-running
-- **WorkflowController** — REST endpoints for CRUD + run/resume operations
-- **Interview Steps** — Mock step definitions simulating a real interview workflow (calendar check, CRM update, email, interview kit, notification)
+- **`engine/workflow-chart.ts`** — XState v5 state chart. `buildInterviewMachine(actors)` registers the five step actors via `setup({ actors })` and returns a fresh machine. `STEP_META` maps state names to step metadata (id, name, maxRetries, index). All guards and actions are declared here; the chart is self-contained.
+- **`engine/workflow-projection.ts`** — Pure functions that mutate the `Workflow` REST shape: `applyStepStarted`, `applyStepCompleted`, `applyStepFailed`, `applyWorkflowCompleted`. The chart's actions delegate to these, so the chart file stays focused on structure while the projection file owns the data shape.
+- **`engine/error-classifier.ts`** — `classifyError(message)` returns `"fatal"` or `"transient"` based on substring matches. Used by the `canRetry` guard in the chart and by `markFailed` to tag the persisted error.
+- **`engine/workflow-persistence.ts`** — Reads/writes workflow state to JSON files in `data/`.
+- **`workflow.service.ts`** — Orchestrates everything. For each `run()`: loads the `Workflow` from disk, builds the actor map from `StepDefinition[]` (wrapping each `execute` in `fromPromise`), computes `startAt` as the first non-completed step, creates the actor with `{ input: { workflow, persist, startAt } }`, starts it, and `waitFor`s the final state.
+- **`workflow.controller.ts`** — REST endpoints for CRUD + run/resume.
+- **`steps/interview-steps.ts`** — Mock step definitions simulating a real interview flow (calendar check, CRM update, confirmation email, interview kit, interviewer notification). Each has configurable fail modes for tests.
 
 ### Frontend (React 19 + Vite + TypeScript)
 
-- **shared/modules architecture** — Reusable UI in `shared/`, feature code in `modules/workflows/`
-- **Polling** — `usePolling` hook refreshes workflow list every 2 seconds for near real-time updates
-- **WorkflowCard** — Shows workflow status, progress bar, expandable step list with error details
+- **shared/modules architecture** — Reusable UI in `shared/`, feature code in `modules/workflows/`.
+- **Polling** — `usePolling` hook refreshes the workflow list every 2 seconds for near real-time updates.
+- **WorkflowCard** — Shows workflow status, progress bar (derived from `steps.filter(completed).length / steps.length`), expandable step list with error details.
 
 ---
 
@@ -202,41 +236,42 @@ The workflow engine is fundamentally a state machine — it has defined states (
 
 | Error Type | Behavior | Example |
 |------------|----------|---------|
-| **Transient** | Retry with exponential backoff (100ms, 200ms, 400ms...) up to `maxRetries` | Timeout, rate limit, connection lost |
-| **Fatal** | Stop immediately, mark workflow as failed | Invalid credentials, permission denied, not found |
+| **Transient** | Retry up to `maxRetries` by self-looping the step state (`onError → canRetry → reenter`) | Timeout, rate limit, connection lost |
+| **Fatal** | Stop immediately, transition to `failed`, mark workflow as failed | Invalid credentials, permission denied, not found, validation error |
 
-Error classification happens inside the `executeStep` actor (XState `fromPromise`). Keywords like `INVALID_CREDENTIALS`, `PERMISSION_DENIED`, `NOT_FOUND`, `VALIDATION_ERROR`, and `FATAL` trigger fatal classification — the actor throws immediately without retrying. Everything else is treated as transient and retried with exponential backoff.
+The `canRetry` guard reads the failing event's error, runs `classifyError()`, and checks the per-state `attempts` counter against `STEP_META[state].maxRetries`. Transient + attempts-left → self-loop with `bumpAttempt`. Fatal or retries exhausted → `target: 'failed'`.
 
 ---
 
 ## Resume / Crash Recovery
 
-1. The XState `persist` action fires on **every state transition**, writing the full workflow context to a JSON file
-2. If the server crashes mid-step, the step stays as `in_progress` in the JSON file
-3. On resume, `in_progress` steps are reset to `pending` (we can't assume the step completed)
-4. A new XState actor is created with the recovered workflow in its context
-5. The machine receives `START` and automatically resumes from the first non-completed step
-6. Already-completed steps are never re-executed
+1. Every chart action (`markStarted`, `markCompleted`, `markFailed`, `markWorkflowCompleted`) calls `persist(workflow)` after mutating. The JSON file on disk always reflects the last chart transition.
+2. If the server crashes mid-step, the step stays `in_progress` in the JSON file.
+3. On resume, the service resets any `in_progress` or `failed` steps to `pending` (we can't assume they completed) and saves.
+4. `run()` recomputes `startAt` as the first non-completed step's state name and creates a fresh actor with that input.
+5. The actor enters `dispatch`, whose `always` transitions route it to the correct step state. `entry: markStarted` fires on that state (workflow step goes `pending → in_progress`), the invoke runs, and the chart proceeds normally.
+6. Already-completed steps are never re-executed.
 
-The test suite (`workflow-resume.spec.ts`) proves this by:
-- Running a workflow that crashes at step 2
-- Creating a fresh engine instance (simulating server restart)
-- Loading state from disk
-- Resuming and verifying step 1 was NOT re-executed
+The test suite (`workflow-resume.spec.ts`) exercises this by:
+- Running a workflow that fails fatally at `update-crm`
+- Creating a fresh `WorkflowService` + `WorkflowPersistence` (simulating server restart)
+- Loading state from disk, resetting failed/in_progress steps to pending
+- Resuming, and asserting that `check-calendar` does NOT appear in the execution log while `update-crm`, `send-confirmation`, `prepare-interview-kit`, and `notify-interviewer` do
 
 ---
 
 ## What I'd Add With More Time
 
-- **XState persistence adapter** — Use XState's built-in `getPersistedSnapshot()` / snapshot rehydration instead of our custom JSON persistence for tighter integration
-- **Stately Studio visualization** — Export the machine definition for visual editing and team collaboration at [stately.ai](https://stately.ai)
-- **WebSocket/SSE** — Replace polling with real-time push updates for step progress
-- **BullMQ integration** — Use Redis-backed job queue instead of in-process execution for horizontal scaling and proper job isolation
-- **Parallel steps** — XState supports parallel states natively — model independent steps as parallel regions in the state chart
-- **Step timeout** — XState's `after` delays can model step timeouts declaratively
-- **Audit log** — Subscribe to actor events for an append-only event log of every state transition
-- **Workflow templates** — Define reusable workflow templates with parameterized steps
-- **Authentication** — JWT-based auth to scope workflows to users/teams
-- **Database persistence** — Replace JSON files with PostgreSQL for production use
-- **Metrics/observability** — Track step duration, retry rates, failure rates per step type
-- **UI improvements** — Workflow detail page, step output viewer, timeline visualization, dark mode
+- **Stately Studio visualization** — Export the machine for visual editing and team collaboration at [stately.ai](https://stately.ai).
+- **WebSocket/SSE** — Replace polling with real-time push updates as the chart transitions.
+- **BullMQ integration** — Use a Redis-backed job queue instead of in-process execution for horizontal scaling and proper job isolation.
+- **Parallel steps** — XState's parallel states could model independent steps (e.g. "send confirmation email" and "prepare interview kit" don't depend on each other) as concurrent regions.
+- **Step timeouts** — XState's `after` delays model step timeouts declaratively — useful for steps like `notify-interviewer` where a stuck Slack call shouldn't hang the whole workflow.
+- **Exponential backoff between retries** — The current chart self-loops immediately on transient errors. Adding a per-state `retryDelay` intermediate state with `after` would reintroduce backoff declaratively.
+- **Compensating transitions** — When `update-crm` fails, a real system would want to roll back the `check-calendar` reservation. The chart could model that as a compensating transition instead of a hard `failed`.
+- **Audit log** — Subscribe to actor state changes for an append-only event log of every transition.
+- **Workflow templates** — Define reusable workflow templates with parameterized steps (e.g. different chart shapes for screening vs. technical vs. onsite interviews).
+- **Authentication** — JWT-based auth to scope workflows to users/teams.
+- **Database persistence** — Replace JSON files with PostgreSQL for production use.
+- **Metrics/observability** — Track step duration, retry rates, failure rates per step type.
+- **UI improvements** — Workflow detail page, step output viewer, timeline visualization, dark mode.
